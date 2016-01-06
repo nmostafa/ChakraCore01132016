@@ -5990,12 +5990,17 @@ GlobOpt::CopyProp(IR::Opnd *opnd, IR::Instr *instr, Value *val, IR::IndirOpnd *p
 
     // SIMD_JS
     // Don't copy-prop operand of SIMD instr with ExtendedArg operands. Each instr should have its exclusive EA sequence.
-    if (Js::IsSimd128Opcode(instr->m_opcode) && instr->GetSrc1() != nullptr && instr->GetSrc2() == nullptr &&  instr->GetSrc1()->GetStackSym()->IsSingleDef())
+    if (
+            Js::IsSimd128Opcode(instr->m_opcode) && 
+            instr->GetSrc1() != nullptr && 
+            instr->GetSrc1()->IsRegOpnd() && 
+            instr->GetSrc2() == nullptr
+       )
     {
-        IR::Instr *defInstr = instr->GetSrc1()->GetStackSym()->GetInstrDef();
-        if (defInstr->m_opcode == Js::OpCode::ExtendArg_A)
+        StackSym *sym = instr->GetSrc1()->GetStackSym();
+        if (sym && sym->IsSingleDef() && sym->GetInstrDef()->m_opcode == Js::OpCode::ExtendArg_A)
         {
-            return opnd;
+                return opnd;
         }
     }
 
@@ -15327,6 +15332,15 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
     bool needsHeadSegment, needsHeadSegmentLength, needsLength, needsBoundChecks;
     switch(instr->m_opcode)
     {
+        // SIMD_JS
+        case Js::OpCode::Simd128_LdArr_F4:
+        case Js::OpCode::Simd128_LdArr_I4:
+            // no type-spec for Asm.js
+            if (this->GetIsAsmJSFunc())
+            {
+                return;
+            }
+            // fall through
         case Js::OpCode::LdElemI_A:
         case Js::OpCode::LdMethodElem:
             if(!instr->GetSrc1()->IsIndirOpnd())
@@ -15337,10 +15351,19 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
             baseOwnerIndir = instr->GetSrc1()->AsIndirOpnd();
             baseOpnd = baseOwnerIndir->GetBaseOpnd();
             isProfilableLdElem = instr->m_opcode == Js::OpCode::LdElemI_A; // LdMethodElem is currently not profiled
+            isProfilableLdElem |= Js::IsSimd128Load(instr->m_opcode);
             needsBoundChecks = needsHeadSegmentLength = needsHeadSegment = isLoad = true;
             needsLength = isStore = isProfilableStElem = false;
             break;
 
+        // SIMD_JS
+        case Js::OpCode::Simd128_StArr_F4:
+        case Js::OpCode::Simd128_StArr_I4:
+            if (this->GetIsAsmJSFunc())
+            {
+                return;
+            }
+            // fall through
         case Js::OpCode::StElemI_A:
         case Js::OpCode::StElemI_A_Strict:
         case Js::OpCode::StElemC:
@@ -15352,6 +15375,7 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
             baseOwnerIndir = instr->GetDst()->AsIndirOpnd();
             baseOpnd = baseOwnerIndir->GetBaseOpnd();
             needsBoundChecks = isProfilableStElem = instr->m_opcode != Js::OpCode::StElemC;
+            isProfilableStElem |= Js::IsSimd128Store(instr->m_opcode);
             needsHeadSegmentLength = needsHeadSegment = isStore = true;
             needsLength = isLoad = isProfilableLdElem = false;
             break;
@@ -15573,8 +15597,17 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
     StackSym *const newHeadSegmentLengthSym = doHeadSegmentLengthLoad ? StackSym::New(TyUint32, instr->m_func) : nullptr;
     StackSym *const newLengthSym = doLengthLoad ? StackSym::New(TyUint32, instr->m_func) : nullptr;
 
-    bool canBailOutOnArrayAccessHelperCall =
-        (isProfilableLdElem || isProfilableStElem) &&
+    bool canBailOutOnArrayAccessHelperCall;
+
+    if (Js::IsSimd128LoadStore(instr->m_opcode))
+    {
+        // SIMD_JS
+        // simd load/store never call helper
+        canBailOutOnArrayAccessHelperCall = true; 
+    }
+    else
+    {
+        canBailOutOnArrayAccessHelperCall = (isProfilableLdElem || isProfilableStElem) &&
         DoEliminateArrayAccessHelperCall() &&
         !(
             instr->IsProfiledInstr() &&
@@ -15584,6 +15617,7 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
                     : instr->AsProfiledInstr()->u.stElemInfo->LikelyNeedsHelperCall()
             )
          );
+    }
 
     bool doExtractBoundChecks = false, eliminatedLowerBoundCheck = false, eliminatedUpperBoundCheck = false;
     StackSym *indexVarSym = nullptr;
@@ -15714,13 +15748,15 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
             }
             AssertVerify(headSegmentLengthValue->GetValueInfo()->TryGetIntConstantBounds(&headSegmentLengthConstantBounds));
 
-            if(ValueInfo::IsLessThan(
+            if (ValueInfo::IsLessThanOrEqualTo(
                     indexValue,
                     indexConstantBounds.LowerBound(),
                     indexConstantBounds.UpperBound(),
                     headSegmentLengthValue,
                     headSegmentLengthConstantBounds.LowerBound(),
-                    headSegmentLengthConstantBounds.UpperBound()))
+                    headSegmentLengthConstantBounds.UpperBound(),
+                    GetBoundCheckOffsetForSimd(newBaseValueType, instr, -1)
+                    ))
             {
                 eliminatedUpperBoundCheck = true;
                 if(eliminatedLowerBoundCheck)
@@ -16163,7 +16199,7 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
             Assert(!baseOwnerIndir->GetIndexOpnd() || baseOwnerIndir->GetIndexOpnd()->m_sym->IsTypeSpec());
             Assert(doHeadSegmentLengthLoad || headSegmentLengthIsAvailable);
             Assert(canBailOutOnArrayAccessHelperCall);
-            Assert(!isStore || instr->m_opcode == Js::OpCode::StElemI_A || instr->m_opcode == Js::OpCode::StElemI_A_Strict);
+            Assert(!isStore || instr->m_opcode == Js::OpCode::StElemI_A || instr->m_opcode == Js::OpCode::StElemI_A_Strict || Js::IsSimd128LoadStore(instr->m_opcode));
 
             StackSym *const headSegmentLengthSym =
                 headSegmentLengthIsAvailable ? baseArrayValueInfo->HeadSegmentLengthSym() : newHeadSegmentLengthSym;
@@ -16207,6 +16243,9 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
                     hoistHeadSegmentLengthLoadOutOfLoop,
                     failedToUpdateCompatibleLowerBoundCheck,
                     failedToUpdateCompatibleUpperBoundCheck);
+
+                // SIMD_JS
+                UpdateBoundCheckHoistInfoForSimd(upperBoundCheckHoistInfo, newBaseValueType, instr);
             }
 
             if(!eliminatedLowerBoundCheck)
@@ -16712,7 +16751,7 @@ GlobOpt::OptArraySrc(IR::Instr * *const instrRef)
                     lowerBound->SetIsJITOptimizedReg(true);
                     IR::Opnd* upperBound = IR::RegOpnd::New(headSegmentLengthSym, headSegmentLengthSym->GetType(), instr->m_func);
                     upperBound->SetIsJITOptimizedReg(true);
-                    const int offset = -1;
+                    const int offset = GetBoundCheckOffsetForSimd(newBaseValueType, instr, -1);
                     IR::Instr *boundCheck;
 
                     // index <= headSegmentLength - 1 (src1 <= src2 + dst)
@@ -19357,7 +19396,10 @@ GlobOpt::RemoveCodeAfterNoFallthroughInstr(IR::Instr *instr)
     FOREACH_SUCCESSOR_BLOCK_EDITING(deadBlock, this->currentBlock, iter)
     {
         this->currentBlock->RemoveDeadSucc(deadBlock, this->func->m_fg);
-        this->currentBlock->DecrementDataUseCount();
+        if (this->currentBlock->GetDataUseCount() > 0)
+        {
+            this->currentBlock->DecrementDataUseCount();
+        }
     } NEXT_SUCCESSOR_BLOCK_EDITING;
 }
 
