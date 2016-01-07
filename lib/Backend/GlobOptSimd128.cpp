@@ -336,7 +336,7 @@ bool GlobOpt::Simd128ValidateIfLaneIndex(const IR::Instr * instr, IR::Opnd * opn
     {
         return false;
     }
-    laneIndex = opnd->AsIntConstOpnd()->GetValue();
+    laneIndex = (uint) opnd->AsIntConstOpnd()->GetValue();
 
     // In range ?
     if (laneIndex < laneIndexLo|| laneIndex > laneIndexHi)
