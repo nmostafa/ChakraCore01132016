@@ -4,9 +4,9 @@
 //-------------------------------------------------------------------------------------------------------
 #include "RuntimeLanguagePch.h"
 
-class ValueType;
 namespace Js
 {
+    
     
     int32 SIMDCheckTypedArrayIndex(ScriptContext* scriptContext, Var index)
     {
@@ -367,37 +367,5 @@ namespace Js
             return (uint32)((Js::OpCode)op - Js::OpCode::Simd128_Start_Extend) + (uint32)(Js::OpCode::Simd128_End - Js::OpCode::Simd128_Start) + 1;
         }
     }
-    
-    
-    int SimdGetElementCountFromBytes(ValueType arrValueType, uint8 dataWidth)
-    {
-        Assert(dataWidth == 4 || dataWidth == 8 || dataWidth == 12 || dataWidth == 16);
-
-        uint bpe = 1;
-        // REVIEW: Do we care about Virtual and Mixed arrays ? The instruction won't be type-spec'ed (replaced by bailout) for Virtual/Mixed types.
-        switch (arrValueType.GetObjectType())
-        {
-        case ObjectType::Int8Array:
-        case ObjectType::Uint8Array:
-            break;
-        case ObjectType::Int16Array:
-        case ObjectType::Uint16Array:
-            bpe = 2;
-            break;
-        case ObjectType::Int32Array:
-        case ObjectType::Uint32Array:
-        case ObjectType::Float32Array:
-            bpe = 4;
-            break;
-        case ObjectType::Float64Array:
-            bpe = 8;
-            break;
-        default:
-            Assert(UNREACHED);
-        }
-
-        // round up
-        return (int)::ceil(((float)dataWidth) / bpe);
-    }
-    
+   
 }

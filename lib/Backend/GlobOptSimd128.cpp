@@ -316,16 +316,25 @@ GlobOpt::Simd128DoTypeSpecLoadStore(IR::Instr *instr, const Value *src1Val, cons
     // array and index operands should have been type-specialized in OptArraySrc: ValueTypes should be definite at this point. If not, don't type-spec.
     // We can be in a loop prepass, where opnd ValueInfo is not set yet. Get the ValueInfo from the Value Table instead.
     ValueType baseOpndType = FindValue(baseOpnd->AsRegOpnd()->m_sym)->GetValueInfo()->Type();
-    ValueType indexOpndType = FindValue(indexOpnd->AsRegOpnd()->m_sym)->GetValueInfo()->Type();
+    
     if (IsLoopPrePass())
     {
-        doTypeSpec = doTypeSpec && (baseOpndType.IsObject() && baseOpndType.GetObjectType() >= ObjectType::Int8Array && baseOpndType.GetObjectType() <= ObjectType::Float64Array);
-        doTypeSpec = doTypeSpec && indexOpndType.IsLikelyInt();
+        doTypeSpec = doTypeSpec && (baseOpndType.IsObject() && baseOpndType.IsTypedArray());
+        // indexOpnd might be missing if loading from [0]
+        if (indexOpnd != nullptr)
+        {
+            ValueType indexOpndType = FindValue(indexOpnd->AsRegOpnd()->m_sym)->GetValueInfo()->Type();
+            doTypeSpec = doTypeSpec && indexOpndType.IsLikelyInt();
+        }
     }
     else
     {
-        doTypeSpec = doTypeSpec && (baseOpndType.IsObject() && baseOpndType.GetObjectType() >= ObjectType::Int8Array && baseOpndType.GetObjectType() <= ObjectType::Float64Array);
-        doTypeSpec = doTypeSpec && indexOpndType.IsInt();
+        doTypeSpec = doTypeSpec && (baseOpndType.IsObject() && baseOpndType.IsTypedArray());
+        if (indexOpnd != nullptr)
+        {
+            ValueType indexOpndType = FindValue(indexOpnd->AsRegOpnd()->m_sym)->GetValueInfo()->Type();
+            doTypeSpec = doTypeSpec && indexOpndType.IsInt();
+        }
     }
 
     return doTypeSpec;
@@ -535,20 +544,20 @@ GlobOpt::GetBoundCheckOffsetForSimd(ValueType arrValueType, const IR::Instr *ins
         return oldOffset;
     }
 
-    if (!(arrValueType.GetObjectType() >= ObjectType::Int8Array && arrValueType.GetObjectType() <= ObjectType::Float64Array))
+    if (!arrValueType.IsTypedArray())
     {
-        // no need to adjust for other types, we will not type-spec (see Simd128DoTypeSpecLoadStore)
+        // no need to adjust for other array types, we will not type-spec (see Simd128DoTypeSpecLoadStore)
         return oldOffset;
     }
 
     Assert(instr->dataWidth == 4 || instr->dataWidth == 8 || instr->dataWidth == 12 || instr->dataWidth == 16);
 
-    int numOfElems = Js::SimdGetElementCountFromBytes(arrValueType, instr->dataWidth);
+    int numOfElems = Lowerer::SimdGetElementCountFromBytes(arrValueType, instr->dataWidth);
 
     // we want to make bound checks more conservative. We compute how many extra elements we need to add to the bound check
     // e.g. if original bound check is value <= Length + offset, and dataWidth is 16 bytes on Float32 array, then we need room for 4 elements. The bound check guarantees room for 1 element.
     // Hence, we need to ensure 3 more: value <= Length + offset - 3
-    // round up since dataWidth may span a partial lane (e.g. dataWidth = 12, bpe = 8 bytes)
+    // We round up since dataWidth may span a partial lane (e.g. dataWidth = 12, bpe = 8 bytes)
 
     int offsetBias = -(numOfElems - 1);
     // we should always make an existing bound-check more conservative.
@@ -576,3 +585,4 @@ GlobOpt::Simd128SetIndirOpndType(IR::IndirOpnd *indirOpnd, Js::OpCode opcode)
     }
 
 }
+

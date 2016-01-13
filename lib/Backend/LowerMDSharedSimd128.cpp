@@ -459,6 +459,14 @@ IR::Instr* LowererMD::Simd128LowerSplat(IR::Instr *instr)
         Assert(UNREACHED);
     }
 
+    if (instr->m_opcode == Js::OpCode::Simd128_Splat_F4 && instr->GetSrc1()->IsFloat64())
+    {
+        IR::RegOpnd *regOpnd32 = IR::RegOpnd::New(TyFloat32, this->m_func);
+        // CVTSD2SS regOpnd32.f32, src.f64    -- Convert regOpnd from f64 to f32
+        instr->InsertBefore(IR::Instr::New(Js::OpCode::CVTSD2SS, regOpnd32, src1, this->m_func));
+        src1 = regOpnd32;
+    }
+
     instr->InsertBefore(IR::Instr::New(movOpCode, dst, src1, m_func));
     instr->InsertBefore(IR::Instr::New(shufOpCode, dst, dst, IR::IntConstOpnd::New(0, TyInt8, m_func, true), m_func));
 
@@ -1010,8 +1018,6 @@ IR::Instr* LowererMD::Simd128AsmJsLowerLoadElem(IR::Instr *instr)
         // (1) constant heap or (2) variable heap with constant index < 16MB.
         // Case (1) requires static bound check. Case (2) means we are always in bound.
 
-
-
         // this can happen in cases where globopt props a constant access which was not known at bytecodegen time or when heap is non-constant
 
         if (src2->IsIntConstOpnd() && ((uint32)src1->AsIndirOpnd()->GetOffset() + dataWidth > src2->AsIntConstOpnd()->AsUint32()))
@@ -1038,7 +1044,7 @@ IR::Instr* LowererMD::Simd128LowerLoadElem(IR::Instr *instr)
     ValueType arrType = src->AsIndirOpnd()->GetBaseOpnd()->GetValueType();
 
     // If we type-specialized, then array is a definite typed-array.
-    Assert(arrType.IsObject() && arrType.GetObjectType() >= ObjectType::Int8Array && arrType.GetObjectType() <= ObjectType::Float64Array);
+    Assert(arrType.IsObject() && arrType.IsTypedArray());
 
     Simd128GenerateUpperBoundCheck(indexOpnd, src->AsIndirOpnd(), arrType, instr);
     Simd128LoadHeadSegment(src->AsIndirOpnd(), arrType, instr);
@@ -1179,7 +1185,7 @@ IR::Instr* LowererMD::Simd128LowerStoreElem(IR::Instr *instr)
     ValueType arrType = dst->AsIndirOpnd()->GetBaseOpnd()->GetValueType();
     
     // If we type-specialized, then array is a definite type-array.
-    Assert(arrType.IsObject() && arrType.GetObjectType() >= ObjectType::Int8Array && arrType.GetObjectType() <= ObjectType::Float64Array);
+    Assert(arrType.IsObject() && arrType.IsTypedArray());
     
     Simd128GenerateUpperBoundCheck(indexOpnd, dst->AsIndirOpnd(), arrType, instr);
     Simd128LoadHeadSegment(dst->AsIndirOpnd(), arrType, instr);
@@ -1246,6 +1252,7 @@ LowererMD::Simd128GenerateUpperBoundCheck(IR::RegOpnd *indexOpnd, IR::IndirOpnd 
 
     IR::ArrayRegOpnd *arrayRegOpnd = indirOpnd->GetBaseOpnd()->AsArrayRegOpnd();
     IR::Opnd* headSegmentLengthOpnd;
+
     if (arrayRegOpnd->EliminatedUpperBoundCheck())
     {
         // already eliminated or extracted by globOpt (OptArraySrc). Nothing to do. 
@@ -1265,15 +1272,29 @@ LowererMD::Simd128GenerateUpperBoundCheck(IR::RegOpnd *indexOpnd, IR::IndirOpnd 
     }
 
     IR::LabelInstr * skipLabel = Lowerer::InsertLabel(false, instr);
-    //  ADD index,  elemCount
-    //  CMP index, tmp  -- upper bound check
-    //  JBE  $storeLabel
-    //  Throw RuntimeError
-    //  skipLabel:
-    IR::RegOpnd *tmp = IR::RegOpnd::New(indexOpnd->GetType(), m_func);
-    IR::IntConstOpnd *elemCount = IR::IntConstOpnd::New(Js::SimdGetElementCountFromBytes(arrayRegOpnd->GetValueType(), instr->dataWidth), TyInt8, m_func, true);
-    Lowerer::InsertAdd(false, tmp, tmp, elemCount, skipLabel);
-    m_lowerer->InsertCompareBranch(indexOpnd, headSegmentLengthOpnd, Js::OpCode::BrLe_A, true, skipLabel, skipLabel);
+    int32 elemCount = Lowerer::SimdGetElementCountFromBytes(arrayRegOpnd->GetValueType(), instr->dataWidth);
+    if (indexOpnd)
+    {
+        //  MOV tmp, elemCount
+        //  ADD tmp, index
+        //  CMP tmp, Length  -- upper bound check
+        //  JBE  $storeLabel
+        //  Throw RuntimeError
+        //  skipLabel:
+        IR::RegOpnd *tmp = IR::RegOpnd::New(indexOpnd->GetType(), m_func);
+        IR::IntConstOpnd *elemCountOpnd = IR::IntConstOpnd::New(elemCount, TyInt8, m_func, true);
+        m_lowerer->InsertMove(tmp, elemCountOpnd, skipLabel);
+        Lowerer::InsertAdd(false, tmp, tmp, indexOpnd, skipLabel);
+        m_lowerer->InsertCompareBranch(tmp, headSegmentLengthOpnd, Js::OpCode::BrLe_A, true, skipLabel, skipLabel);
+    }
+    else
+    {
+        // CMP Length, (offset + elemCount)
+        // JA $storeLabel
+        int32 offset = indirOpnd->GetOffset();
+        int32 index = offset + elemCount;
+        m_lowerer->InsertCompareBranch(headSegmentLengthOpnd, IR::IntConstOpnd::New(index, TyInt32, m_func, true), Js::OpCode::BrLe_A, true, skipLabel, skipLabel);
+    }
     m_lowerer->GenerateRuntimeError(skipLabel, JSERR_ArgumentOutOfRange, IR::HelperOp_RuntimeRangeError);
     return;
 }
@@ -1559,26 +1580,6 @@ void LowererMD::InsertShufps(uint8 lanes[], IR::Opnd *dst, IR::Opnd *src1, IR::O
 
 BYTE LowererMD::Simd128GetTypedArrBytesPerElem(ValueType arrType)
 {
-    BYTE bpe = 1;
-    switch (arrType.GetObjectType())
-    {
-    case ObjectType::Int8Array:
-    case ObjectType::Uint8Array:
-        break;
-    case ObjectType::Int16Array:
-    case ObjectType::Uint16Array:
-        bpe = 2;
-        break;
-    case ObjectType::Int32Array:
-    case ObjectType::Uint32Array:
-    case ObjectType::Float32Array:
-        bpe = 4;
-        break;
-    case ObjectType::Float64Array:
-        bpe = 8;
-        break;
-    default:
-        Assert(UNREACHED);
-    }
-    return bpe;
+    return  (1 << Lowerer::GetArrayIndirScale(arrType));
 }
+

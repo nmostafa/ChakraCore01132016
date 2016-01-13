@@ -121,6 +121,7 @@ typedef SIMDValue     AsmJsSIMDValue; // alias for asmjs
 CompileAssert(sizeof(SIMDValue) == 16);
 
 class ValueType;
+
 namespace Js {
     int32 SIMDCheckTypedArrayIndex(ScriptContext* scriptContext, Var index);
     int32 SIMDCheckLaneIndex(ScriptContext* scriptContext, Var lane, const int32 range = 4);
@@ -166,8 +167,5 @@ namespace Js {
 
     enum class OpCode : ushort;
     uint32 SimdOpcodeAsIndex(Js::OpCode op);
-    
-    int SimdGetElementCountFromBytes(ValueType arrValueType, uint8 dataWidth);
-
 
 }
